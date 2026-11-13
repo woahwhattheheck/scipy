@@ -562,3 +562,161 @@ def test_read_withMaskAndScaleFalse():
         vardata = f.variables['var3_fillvalAndMissingValue'][:]
         assert_mask_matches(vardata, [False, False, False])
         assert_equal(vardata, [1, 2, 3])
+
+
+@pytest.mark.parametrize('version', [1, 2])
+@pytest.mark.parametrize('typecode, fill_value', [
+    ('h', -32767), ('i', -2147483647),
+    ('f', 9.969209968386869e36), ('d', 9.969209968386869e36),
+    ('c', b'')])
+def test_read_implicit_fill_value(tmp_path, version, typecode, fill_value):
+    # A valid NetCDF producer need not store an explicit _FillValue attribute.
+    # In particular, netCDF4 writes masked data with these default sentinels.
+    path = tmp_path / 'implicit-fill.nc'
+    values = [b'a', fill_value, b'b'] if typecode == 'c' else [1, fill_value, 2]
+    with netcdf_file(path, 'w', version=version) as f:
+        f.createDimension('x', 3)
+        var = f.createVariable('data', typecode, ('x',))
+        var[:] = np.asarray(values, dtype='S1') if typecode == 'c' else values
+    with netcdf_file(path, maskandscale=True) as f:
+        assert '_FillValue' not in f.variables['data']._attributes
+        assert 'missing_value' not in f.variables['data']._attributes
+        actual = f.variables['data'][:]
+        assert_mask_matches(actual, [False, True, False])
+        assert_equal(actual.compressed(), [values[0], values[2]])
+        assert np.ma.is_masked(f.variables['data'][1])
+    with netcdf_file(path, maskandscale=False, mmap=False) as f:
+        actual = f.variables['data'][:]
+        assert not np.ma.isMaskedArray(actual)
+        assert_equal(actual[1], np.asarray(fill_value, dtype=actual.dtype))
+
+
+def test_read_implicit_byte_fill_value(tmp_path):
+    # Without an explicit fill attribute, the NetCDF byte convention permits
+    # the entire byte range, including the otherwise conventional -127 value.
+    path = tmp_path / 'byte-fill.nc'
+    values = np.arange(-128, 128, dtype=np.int16).astype(np.int8)
+    with netcdf_file(path, 'w') as f:
+        f.createDimension('x', values.size)
+        f.createVariable('data', 'b', ('x',))[:] = values
+    with netcdf_file(path, maskandscale=True, mmap=False) as f:
+        actual = f.variables['data'][:]
+        assert not np.ma.getmaskarray(actual).any()
+        assert_equal(actual, values)
+
+
+def test_read_implicit_fill_before_scaling(tmp_path):
+    path = tmp_path / 'packed-default.nc'
+    with netcdf_file(path, 'w') as f:
+        f.createDimension('x', 3)
+        var = f.createVariable('data', 'h', ('x',))
+        var.scale_factor = 0.5
+        var.add_offset = 10.0
+        var[:] = [2, -32767, 4]
+    with netcdf_file(path, maskandscale=True) as f:
+        actual = f.variables['data'][:]
+        assert_mask_matches(actual, [False, True, False])
+        assert_equal(actual.compressed(), [11, 12])
+
+
+@pytest.mark.parametrize('attribute', ['_FillValue', 'missing_value'])
+def test_write_zero_missing_value(tmp_path, attribute):
+    path = tmp_path / 'zero-fill.nc'
+    with netcdf_file(path, 'w', maskandscale=True) as f:
+        f.createDimension('x', 3)
+        var = f.createVariable('data', 'h', ('x',))
+        setattr(var, attribute, np.int16(0))
+        var.scale_factor = 0.5
+        var.add_offset = 10.0
+        var[:] = np.ma.array([10.5, 999, 11.0], mask=[False, True, False])
+    with netcdf_file(path, mmap=False) as f:
+        assert_equal(f.variables['data'][:], [1, 0, 2])
+        assert_equal(f.variables['data']._FillValue, 0)
+        assert_equal(f.variables['data'].missing_value, 0)
+    with netcdf_file(path, maskandscale=True) as f:
+        actual = f.variables['data'][:]
+        assert_mask_matches(actual, [False, True, False])
+        assert_equal(actual.compressed(), [10.5, 11.0])
+
+
+def test_read_vector_missing_value(tmp_path):
+    path = tmp_path / 'multiple-missing.nc'
+    with netcdf_file(path, 'w') as f:
+        f.createDimension('x', 4)
+        var = f.createVariable('data', 'd', ('x',))
+        var.missing_value = np.array([-999, np.nan])
+        var.scale_factor = 0.5
+        var.add_offset = 10
+        var[:] = [2, -999, np.nan, 4]
+    with netcdf_file(path, maskandscale=True) as f:
+        actual = f.variables['data'][:]
+        assert_mask_matches(actual, [False, True, True, False])
+        assert_equal(actual.compressed(), [11, 12])
+
+
+def test_write_vector_missing_value(tmp_path):
+    path = tmp_path / 'multiple-missing-write.nc'
+    with netcdf_file(path, 'w', maskandscale=True) as f:
+        f.createDimension('x', 4)
+        var = f.createVariable('data', 'i', ('x',))
+        var.missing_value = np.array([0, -1], dtype=np.int32)
+        var[:] = np.ma.array([1, 99, -1, 2], mask=[False, True, False, False])
+        assert '_FillValue' not in var._attributes
+    with netcdf_file(path, maskandscale=True) as f:
+        actual = f.variables['data'][:]
+        assert_mask_matches(actual, [False, True, True, False])
+        assert_equal(actual.compressed(), [1, 2])
+
+
+def test_write_empty_missing_value(tmp_path):
+    path = tmp_path / 'empty-missing-write.nc'
+    with netcdf_file(path, 'w', maskandscale=True) as f:
+        f.createDimension('x', 3)
+        var = f.createVariable('data', 'i', ('x',))
+        var.missing_value = np.array([], dtype=np.int32)
+        var[:] = np.ma.array([1, 99, 2], mask=[False, True, False], fill_value=-999)
+    with netcdf_file(path, maskandscale=True) as f:
+        actual = f.variables['data'][:]
+        assert_mask_matches(actual, [False, True, False])
+        assert_equal(actual.compressed(), [1, 2])
+
+
+@pytest.mark.parametrize('typecode', ['b', 'h', 'i', 'f', 'd'])
+def test_write_implicit_missing_value_fits_storage(tmp_path, typecode):
+    path = tmp_path / 'implicit-write.nc'
+    input_dtype = np.int64 if typecode in 'bhi' else np.float64
+    values = np.ma.array([1, 99, 2], dtype=input_dtype,
+                         mask=[False, True, False])
+    with netcdf_file(path, 'w', maskandscale=True) as f:
+        f.createDimension('x', 3)
+        f.createVariable('data', typecode, ('x',))[:] = values
+    with netcdf_file(path, mmap=False) as f:
+        var = f.variables['data']
+        assert_equal(var[1], var._FillValue)
+        assert_equal(var._FillValue.dtype.kind, var.data.dtype.kind)
+        assert_equal(var._FillValue.dtype.itemsize, var.data.dtype.itemsize)
+    with netcdf_file(path, maskandscale=True) as f:
+        actual = f.variables['data'][:]
+        assert_mask_matches(actual, [False, True, False])
+        assert_equal(actual.compressed(), [1, 2])
+
+
+def test_write_missing_value_after_packing(tmp_path):
+    path = tmp_path / 'float32-packed-int32.nc'
+    with netcdf_file(path, 'w', maskandscale=True) as f:
+        f.createDimension('x', 3)
+        var = f.createVariable('data', 'i', ('x',))
+        var.scale_factor = np.float32(0.5)
+        var.add_offset = np.float32(0)
+        # The int32 default fill -2147483647 is not representable in float32.
+        # Masked NaNs must not be cast before their mask is applied either.
+        var[:] = np.ma.array([1, np.nan, 2], dtype=np.float32,
+                             mask=[False, True, False])
+    with netcdf_file(path, mmap=False) as f:
+        var = f.variables['data']
+        assert_equal(var[:], [2, -2147483647, 4])
+        assert_equal(var[1], var._FillValue)
+    with netcdf_file(path, maskandscale=True) as f:
+        actual = f.variables['data'][:]
+        assert_mask_matches(actual, [False, True, False])
+        assert_equal(actual.compressed(), [1, 2])
