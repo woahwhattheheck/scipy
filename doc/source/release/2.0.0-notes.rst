@@ -56,6 +56,11 @@ New features
 ``scipy.sparse`` improvements
 =============================
 
+- `scipy.sparse.linalg.bicg` and `scipy.sparse.linalg.bicgstab` now verify the true
+  residual before reporting successful convergence and restart when rounding
+  error causes the recursively
+  updated residual to underestimate it. This prevents false success with large
+  initial guesses or ill-conditioned systems.
 
 
 ``scipy.spatial`` improvements

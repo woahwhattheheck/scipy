@@ -2,7 +2,7 @@ import warnings
 import numpy as np
 from scipy.sparse.linalg._interface import LinearOperator
 from .utils import make_system
-from scipy.linalg import get_lapack_funcs
+from scipy.linalg import get_lapack_funcs, norm
 from scipy._lib._array_api import xp_capabilities
 
 __all__ = ['bicg', 'bicgstab', 'cg', 'cgs', 'gmres', 'qmr']
@@ -43,8 +43,9 @@ def bicg(A, b, x0=None, *, rtol=1e-5, atol=0., maxiter=None, M=None, callback=No
         ``norm(b - A @ x) <= max(rtol*norm(b), atol)`` should be satisfied.
         The default is ``atol=0.`` and ``rtol=1e-5``.
     maxiter : int
-        Maximum number of iterations.  Iteration will stop after maxiter
-        steps even if the specified tolerance has not been achieved.
+        Maximum number of iterations, which must be greater than zero.
+        Iteration will stop after maxiter steps even if the specified
+        tolerance has not been achieved.
     M : {sparse array, ndarray, LinearOperator}
         Preconditioner for `A`. It should approximate the
         inverse of `A` (see Notes). Effective preconditioning dramatically improves the
@@ -69,6 +70,11 @@ def bicg(A, b, x0=None, *, rtol=1e-5, atol=0., maxiter=None, M=None, callback=No
     The preconditioner `M` should be a matrix such that ``M @ A`` has a smaller
     condition number than `A`, see [1]_ .
 
+    Convergence is checked with the true residual ``b - A @ x``. If the
+    recursively updated residual meets the tolerance but the true residual
+    does not, both coupled iterations restart from the current solution.
+    Restarts count towards `maxiter`.
+
     References
     ----------
     .. [1] "Preconditioner", Wikipedia,
@@ -90,9 +96,11 @@ def bicg(A, b, x0=None, *, rtol=1e-5, atol=0., maxiter=None, M=None, callback=No
     True
     """
     A, M, x, b = make_system(A, M, x0, b)
-    bnrm2 = np.linalg.norm(b)
+    bnrm2 = norm(b, check_finite=False)
 
     atol, _ = _get_atol_rtol('bicg', bnrm2, atol, rtol)
+    if maxiter is not None and maxiter <= 0:
+        raise ValueError("maxiter must be greater than 0")
 
     if bnrm2 == 0:
         return b, 0
@@ -115,8 +123,19 @@ def bicg(A, b, x0=None, *, rtol=1e-5, atol=0., maxiter=None, M=None, callback=No
     rtilde = r.copy()
 
     for iteration in range(maxiter):
-        if np.linalg.norm(r) < atol:  # Are we done?
-            return x, 0
+        if norm(r, check_finite=False) <= atol:
+            # Verify convergence against the original system, since the
+            # recursively updated primal residual can lose accuracy.
+            r = b - matvec(x)
+            rnorm = norm(r, check_finite=False)
+            # A finite right-hand side can have an unrepresentable norm.
+            # An exactly zero true residual still establishes convergence.
+            if (np.isfinite(rnorm) and rnorm <= atol
+                    and (np.isfinite(bnrm2) or rnorm == 0)):
+                return x, 0
+            # Restart both coupled recurrences from a new shadow residual.
+            rtilde = r.copy()
+            rho_prev = None
 
         z = psolve(r)
         ztilde = rpsolve(rtilde)
@@ -126,13 +145,13 @@ def bicg(A, b, x0=None, *, rtol=1e-5, atol=0., maxiter=None, M=None, callback=No
         if np.abs(rho_cur) < rhotol:  # Breakdown case
             return x, -10
 
-        if iteration > 0:
+        if rho_prev is not None:
             beta = rho_cur / rho_prev
             p *= beta
             p += z
             ptilde *= beta.conj()
             ptilde += ztilde
-        else:  # First spin
+        else:  # First iteration, or restart after residual replacement
             p = z.copy()
             ptilde = ztilde.copy()
 
@@ -153,8 +172,12 @@ def bicg(A, b, x0=None, *, rtol=1e-5, atol=0., maxiter=None, M=None, callback=No
             callback(x)
 
     else:  # for loop exhausted
-        # Return incomplete progress
-        return x, maxiter
+        # The final update may satisfy the tolerance without another iteration.
+        r = b - matvec(x)
+        rnorm = norm(r, check_finite=False)
+        converged = (np.isfinite(rnorm) and rnorm <= atol
+                     and (np.isfinite(bnrm2) or rnorm == 0))
+        return x, 0 if converged else maxiter
 
 
 @xp_capabilities(np_only=True)
@@ -179,8 +202,9 @@ def bicgstab(A, b, x0=None, *, rtol=1e-5, atol=0., maxiter=None, M=None,
         ``norm(b - A @ x) <= max(rtol*norm(b), atol)`` should be satisfied.
         The default is ``atol=0.`` and ``rtol=1e-5``.
     maxiter : int
-        Maximum number of iterations.  Iteration will stop after maxiter
-        steps even if the specified tolerance has not been achieved.
+        Maximum number of iterations, which must be greater than zero.
+        Iteration will stop after maxiter steps even if the specified
+        tolerance has not been achieved.
     M : {sparse array, ndarray, LinearOperator}
         Preconditioner for `A`. It should approximate the
         inverse of `A` (see Notes). Effective preconditioning dramatically improves the
@@ -204,6 +228,11 @@ def bicgstab(A, b, x0=None, *, rtol=1e-5, atol=0., maxiter=None, M=None,
     -----
     The preconditioner `M` should be a matrix such that ``M @ A`` has a smaller
     condition number than `A`, see [1]_ .
+
+    Convergence is checked with the true residual ``b - A @ x``. If the
+    recursively updated residual meets the tolerance but the true residual
+    does not, the iteration restarts from the current solution. Restarts count
+    towards `maxiter`.
 
     References
     ----------
@@ -230,9 +259,11 @@ def bicgstab(A, b, x0=None, *, rtol=1e-5, atol=0., maxiter=None, M=None,
     True
     """
     A, M, x, b = make_system(A, M, x0, b)
-    bnrm2 = np.linalg.norm(b)
+    bnrm2 = norm(b, check_finite=False)
 
     atol, _ = _get_atol_rtol('bicgstab', bnrm2, atol, rtol)
+    if maxiter is not None and maxiter <= 0:
+        raise ValueError("maxiter must be greater than 0")
 
     if bnrm2 == 0:
         return b, 0
@@ -257,16 +288,27 @@ def bicgstab(A, b, x0=None, *, rtol=1e-5, atol=0., maxiter=None, M=None,
 
     r = b - matvec(x) if x.any() else b.copy()
     rtilde = r.copy()
+    s = np.empty_like(r)
 
     for iteration in range(maxiter):
-        if np.linalg.norm(r) < atol:  # Are we done?
-            return x, 0
+        if norm(r, check_finite=False) <= atol:
+            # The recurrence can drift away from the true residual. Verify the
+            # documented tolerance before accepting the current iterate.
+            r = b - matvec(x)
+            rnorm = norm(r, check_finite=False)
+            # A finite right-hand side can have an unrepresentable norm.
+            # An exactly zero true residual still establishes convergence.
+            if (np.isfinite(rnorm) and rnorm <= atol
+                    and (np.isfinite(bnrm2) or rnorm == 0)):
+                return x, 0
+            rtilde = r.copy()
+            rho_prev = None
 
         rho = dotprod(rtilde, r)
         if np.abs(rho) < rhotol:  # rho breakdown
             return x, -10
 
-        if iteration > 0:
+        if rho_prev is not None:
             if np.abs(omega) < omegatol:  # omega breakdown
                 return x, -11
 
@@ -274,8 +316,7 @@ def bicgstab(A, b, x0=None, *, rtol=1e-5, atol=0., maxiter=None, M=None,
             p -= omega*v
             p *= beta
             p += r
-        else:  # First spin
-            s = np.empty_like(r)
+        else:  # First iteration, or restart after residual replacement
             p = r.copy()
 
         phat = psolve(p)
@@ -287,9 +328,21 @@ def bicgstab(A, b, x0=None, *, rtol=1e-5, atol=0., maxiter=None, M=None,
         r -= alpha*v
         s[:] = r[:]
 
-        if np.linalg.norm(s) < atol:
+        if norm(s, check_finite=False) <= atol:
             x += alpha*phat
-            return x, 0
+            r = b - matvec(x)
+            rnorm = norm(r, check_finite=False)
+            if (np.isfinite(rnorm) and rnorm <= atol
+                    and (np.isfinite(bnrm2) or rnorm == 0)):
+                return x, 0
+            # Restart from the accepted iterate and its true residual. Reusing
+            # the old shadow residual or search direction would invalidate the
+            # BiCGSTAB recurrence after this replacement.
+            rtilde = r.copy()
+            rho_prev = None
+            if callback:
+                callback(x)
+            continue
 
         shat = psolve(s)
         t = matvec(shat)
@@ -303,8 +356,12 @@ def bicgstab(A, b, x0=None, *, rtol=1e-5, atol=0., maxiter=None, M=None,
             callback(x)
 
     else:  # for loop exhausted
-        # Return incomplete progress
-        return x, maxiter
+        # The final update may satisfy the tolerance without another iteration.
+        r = b - matvec(x)
+        rnorm = norm(r, check_finite=False)
+        converged = (np.isfinite(rnorm) and rnorm <= atol
+                     and (np.isfinite(bnrm2) or rnorm == 0))
+        return x, 0 if converged else maxiter
 
 
 @xp_capabilities(np_only=True)

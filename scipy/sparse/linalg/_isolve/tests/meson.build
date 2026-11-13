@@ -1,5 +1,7 @@
 py3.install_sources([
     '__init__.py',
+    'test_bicg_residual.py',
+    'test_bicgstab_residual.py',
     'test_gcrotmk.py',
     'test_iterative.py',
     'test_lgmres.py',
