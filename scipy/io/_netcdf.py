@@ -125,7 +125,9 @@ class netcdf_file:
         for more info.
     maskandscale : bool, optional
         Whether to automatically scale and/or mask data based on attributes.
-        Default is False.
+        Default is False. If neither ``_FillValue`` nor ``missing_value`` is
+        specified, the NetCDF default fill value is masked, except for byte
+        variables, for which all values are valid by default.
 
     Notes
     -----
@@ -979,7 +981,7 @@ class netcdf_variable:
             return self.data[index]
 
         data = self.data[index].copy()
-        missing_value = self._get_missing_value()
+        missing_value = self._get_missing_value(use_default=True)
         data = self._apply_missing_value(data, missing_value)
         scale_factor = self._attributes.get('scale_factor')
         add_offset = self._attributes.get('add_offset')
@@ -994,16 +996,52 @@ class netcdf_variable:
 
     def __setitem__(self, index, data):
         if self.maskandscale:
-            missing_value = (
-                    self._get_missing_value() or
-                    getattr(data, 'fill_value', 999999))
+            missing_value = self._get_missing_value()
+            missing_values = (np.asarray(missing_value).ravel()
+                              if missing_value is not None else np.array([]))
+            if not missing_values.size:
+                missing_value = getattr(data, 'fill_value', 999999)
+                # NumPy's default masked fill may not fit the packed dtype
+                # (e.g. 999999 for int16). Metadata and stored marker must agree.
+                try:
+                    value = np.asarray(missing_value).item()
+                    with np.errstate(over='ignore', invalid='ignore'):
+                        encoded = np.asarray(value, dtype=self.data.dtype)
+                    packed_value = encoded.item()
+                    valid = (value == packed_value or
+                             (np.isnan(value) and np.isnan(packed_value)))
+                except (TypeError, ValueError, OverflowError):
+                    valid = False
+                if valid:
+                    missing_value = encoded[()]
+                else:
+                    missing_value = frombuffer(
+                        self._default_encoded_fill_value(),
+                        dtype=self.data.dtype.newbyteorder('>'), count=1)[0]
+            elif np.ndim(missing_value):
+                has_dtype = hasattr(missing_value, 'dtype')
+                missing_value = missing_values[0]
+                if not has_dtype:
+                    missing_value = missing_value.item()
+            # missing_value can contain several sentinels, but a masked value
+            # needs a single on-disk representation and _FillValue is scalar.
             self._attributes.setdefault('missing_value', missing_value)
-            self._attributes.setdefault('_FillValue', missing_value)
+            if missing_values.size <= 1:
+                self._attributes.setdefault('_FillValue', missing_value)
+            # Do not add _FillValue for a vector missing_value: its precedence
+            # on reads would otherwise hide the remaining missing sentinels.
             data = ((data - self._attributes.get('add_offset', 0.0)) /
                     self._attributes.get('scale_factor', 1.0))
-            data = np.ma.asarray(data).filled(missing_value)
+            data = np.ma.asarray(data)
             if self._typecode not in 'fd' and data.dtype.kind == 'f':
                 data = np.round(data)
+            # Fill after conversion to the packed dtype: a floating-point
+            # intermediate may round an integer marker to a different value.
+            # Use zero during conversion so masked NaNs cannot trigger casts.
+            mask = np.ma.getmask(data)
+            data = np.asarray(data.filled(0), dtype=self.data.dtype)
+            if np.any(mask):
+                data[mask] = missing_value
 
         # Expand data for record vars?
         if self.isrec:
@@ -1050,11 +1088,13 @@ class netcdf_variable:
         else:
             return self._default_encoded_fill_value()
 
-    def _get_missing_value(self):
+    def _get_missing_value(self, *, use_default=False):
         """
         Returns the value denoting "no data" for this variable.
 
-        If this variable does not have a missing/fill value, returns None.
+        If this variable does not have a missing/fill value, return the default
+        fill value when use_default is True. Byte variables have no implicit
+        missing value, so every byte remains usable as data.
 
         If both _FillValue and missing_value are given, give precedence to
         _FillValue. The netCDF standard gives special meaning to _FillValue;
@@ -1065,6 +1105,12 @@ class netcdf_variable:
             missing_value = self._attributes['_FillValue']
         elif 'missing_value' in self._attributes:
             missing_value = self._attributes['missing_value']
+        elif use_default and self.typecode() != 'b':
+            # FILLMAP contains bytes in the NetCDF external (big-endian)
+            # representation, independently of the in-memory array byte order.
+            missing_value = frombuffer(
+                self._default_encoded_fill_value(),
+                dtype=self.data.dtype.newbyteorder('>'), count=1)[0]
         else:
             missing_value = None
 
@@ -1075,28 +1121,30 @@ class netcdf_variable:
         """
         Applies the given missing value to the data array.
 
-        Returns a numpy.ma array, with any value equal to missing_value masked
-        out (unless missing_value is None, in which case the original array is
-        returned).
+        Returns a numpy.ma array, with any value equal to one of the scalar or
+        vector missing values masked out. NaN sentinels also mask NaN data.
+        If missing_value is None, the original array is returned.
         """
 
         if missing_value is None:
-            newdata = data
-        else:
+            return data
+
+        mymask = np.zeros(np.shape(data), dtype=bool)
+        for value in np.asarray(missing_value).ravel():
             try:
-                missing_value_isnan = np.isnan(missing_value)
+                missing_value_isnan = np.isnan(value)
             except (TypeError, NotImplementedError):
                 # some data types (e.g., characters) cannot be tested for NaN
                 missing_value_isnan = False
 
             if missing_value_isnan:
-                mymask = np.isnan(data)
+                mymask |= np.isnan(data)
             else:
-                mymask = (data == missing_value)
+                mymask |= (data == value)
 
-            newdata = np.ma.masked_where(mymask, data)
-
-        return newdata
+        # NumPy scalars need a zero-dimensional array before copy=False;
+        # ndarray reads already own their data and do not need another copy.
+        return np.ma.masked_where(mymask, np.asanyarray(data), copy=False)
 
 
 NetCDFFile = netcdf_file
